@@ -1,7 +1,7 @@
 #ifndef WAKE_SCHEMA_H
 #define WAKE_SCHEMA_H
 
-#define SCHEMA_VERSION "9"
+#define SCHEMA_VERSION "10"
 
 // Increment the SCHEMA_VERSION every time the below string changes.
 // Also add migrations to the wake-migration tool if needed.
@@ -23,10 +23,11 @@ inline const char* getWakeSchemaSQL() {
          "  time    integer not null,"
          "  cmdline text    not null);"
          "create table if not exists files("
-         "  file_id  integer primary key,"
-         "  path     text    not null,"
-         "  hash     text    not null,"
-         "  modified integer not null);"
+         "  file_id   integer primary key,"
+         "  path      text    not null,"
+         "  hash      text    not null,"
+         "  type      text    not null default 'file',"
+         "  modified  integer not null);"
          "create unique index if not exists filenames on files(path);"
          "create table if not exists stats("
          "  stat_id    integer primary key autoincrement,"

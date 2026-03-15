@@ -39,7 +39,7 @@ export def files (dir: String) (regexp: RegExp): List String =
     p dir regexp
 
 def raw_source file =
-    def get_modtime file = prim "get_modtime"
+    def get_modtime path = prim "get_modtime"
     def time = get_modtime file
 
     if time == -1 then
@@ -51,7 +51,6 @@ def raw_source file =
         | setPlanEcho logDebug
         | setPlanEnvironment Nil
         | setPlanFnOutputs (file, _)
-        | setPlanEcho logDebug
         | runJobWith virtualRunner
         | setJobInspectVisibilityHidden
         | getJobOutput

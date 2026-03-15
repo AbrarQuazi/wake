@@ -46,6 +46,11 @@
 #define OUTPUT 2
 #define INDEXES 3
 
+static std::string normalize_file_reflection_type(const std::string &stored_type) {
+  if (!stored_type.empty()) return stored_type;
+  return "file";
+}
+
 struct Database::detail {
   bool debugdb;
   sqlite3 *db;
@@ -73,6 +78,7 @@ struct Database::detail {
   sqlite3_stmt *update_prior;
   sqlite3_stmt *delete_prior;
   sqlite3_stmt *fetch_hash;
+  sqlite3_stmt *fetch_hash_type;
   sqlite3_stmt *delete_jobs;
   sqlite3_stmt *delete_dups;
   sqlite3_stmt *delete_stats;
@@ -121,6 +127,7 @@ struct Database::detail {
         update_prior(0),
         delete_prior(0),
         fetch_hash(0),
+        fetch_hash_type(0),
         delete_jobs(0),
         delete_dups(0),
         delete_stats(0),
@@ -360,13 +367,13 @@ std::string Database::open(bool wait, bool memory, bool tty, bool readonly) {
       " (select t.job_id from files f, filetree t"
       "  where f.path=? and f.hash<>? and t.file_id=f.file_id and t.access=1)";
   const char *sql_insert_file =
-      "insert or ignore into files(hash, modified, path) values (?, ?, ?)";
-  const char *sql_update_file = "update files set hash=?, modified=? where path=?";
+      "insert or ignore into files(hash, type, modified, path) values (?, ?, ?, ?)";
+  const char *sql_update_file = "update files set hash=?, type=?, modified=? where path=?";
   const char *sql_get_log =
       "select output from log where job_id=? and descriptor=? order by log_id";
   const char *sql_replay_log = "select descriptor, output from log where job_id=? order by log_id";
   const char *sql_get_tree =
-      "select f.path, f.hash from filetree t, files f"
+      "select f.path, f.hash, f.type from filetree t, files f"
       " where t.job_id=? and t.access=? and f.file_id=t.file_id order by t.tree_id";
   const char *sql_add_stats =
       "insert into stats(hashcode, status, runtime, cputime, membytes, ibytes, obytes)"
@@ -395,6 +402,7 @@ std::string Database::open(bool wait, bool memory, bool tty, bool readonly) {
       "  and j1.environment=j2.environment and j1.stdin=j2.stdin and j1.is_atty=j2.is_atty and "
       "j2.job_id<>?2)";
   const char *sql_fetch_hash = "select hash from files where path=? and modified=?";
+  const char *sql_fetch_hash_type = "select hash, type from files where path=? and modified=?";
   const char *sql_delete_jobs =
       "delete from jobs where job_id in"
       " (select job_id from jobs where keep=0 and use_id<>? except select job_id from filetree "
@@ -490,6 +498,7 @@ std::string Database::open(bool wait, bool memory, bool tty, bool readonly) {
   PREPARE(sql_update_prior, update_prior);
   PREPARE(sql_delete_prior, delete_prior);
   PREPARE(sql_fetch_hash, fetch_hash);
+  PREPARE(sql_fetch_hash_type, fetch_hash_type);
   PREPARE(sql_delete_jobs, delete_jobs);
   PREPARE(sql_delete_dups, delete_dups);
   PREPARE(sql_delete_stats, delete_stats);
@@ -551,6 +560,7 @@ void Database::close() {
   FINALIZE(update_prior);
   FINALIZE(delete_prior);
   FINALIZE(fetch_hash);
+  FINALIZE(fetch_hash_type);
   FINALIZE(delete_jobs);
   FINALIZE(delete_dups);
   FINALIZE(delete_stats);
@@ -906,8 +916,10 @@ Usage Database::reuse_job(const std::string &directory, const std::string &envir
   bind_integer(why, imp->get_tree, 2, OUTPUT);
   while (sqlite3_step(imp->get_tree) == SQLITE_ROW) {
     std::string path = rip_column(imp->get_tree, 0);
+    std::string hash = rip_column(imp->get_tree, 1);
+    std::string type = normalize_file_reflection_type(rip_column(imp->get_tree, 2));
     if (faccessat(AT_FDCWD, path.c_str(), R_OK, AT_SYMLINK_NOFOLLOW) != 0) out.found = false;
-    files.emplace_back(std::move(path), rip_column(imp->get_tree, 1));
+    files.emplace_back(std::move(path), std::move(type), std::move(hash));
   }
   finish_stmt(why, imp->get_tree, imp->debugdb);
 
@@ -1139,8 +1151,12 @@ std::vector<FileReflection> Database::get_tree(int kind, long job) {
   const char *why = "Could not read job tree";
   bind_integer(why, imp->get_tree, 1, job);
   bind_integer(why, imp->get_tree, 2, kind);
-  while (sqlite3_step(imp->get_tree) == SQLITE_ROW)
-    out.emplace_back(rip_column(imp->get_tree, 0), rip_column(imp->get_tree, 1));
+  while (sqlite3_step(imp->get_tree) == SQLITE_ROW) {
+    std::string path = rip_column(imp->get_tree, 0);
+    std::string hash = rip_column(imp->get_tree, 1);
+    std::string type = normalize_file_reflection_type(rip_column(imp->get_tree, 2));
+    out.emplace_back(std::move(path), std::move(type), std::move(hash));
+  }
   finish_stmt(why, imp->get_tree, imp->debugdb);
   return out;
 }
@@ -1190,19 +1206,22 @@ void Database::replay_output(long job, const char *stdout, const char *stderr,
   finish_stmt(why, imp->replay_log, imp->debugdb);
 }
 
-void Database::add_hash(const std::string &file, const std::string &hash, long modified) {
+void Database::add_hash(const std::string &file, const std::string &type, const std::string &hash,
+                        long modified) {
   const char *why = "Could not insert a hash";
   begin_txn();
   bind_string(why, imp->wipe_file, 1, file);
   bind_string(why, imp->wipe_file, 2, hash);
   single_step(why, imp->wipe_file, imp->debugdb);
   bind_string(why, imp->update_file, 1, hash);
-  bind_integer(why, imp->update_file, 2, modified);
-  bind_string(why, imp->update_file, 3, file);
+  bind_string(why, imp->update_file, 2, type);
+  bind_integer(why, imp->update_file, 3, modified);
+  bind_string(why, imp->update_file, 4, file);
   single_step(why, imp->update_file, imp->debugdb);
   bind_string(why, imp->insert_file, 1, hash);
-  bind_integer(why, imp->insert_file, 2, modified);
-  bind_string(why, imp->insert_file, 3, file);
+  bind_string(why, imp->insert_file, 2, type);
+  bind_integer(why, imp->insert_file, 3, modified);
+  bind_string(why, imp->insert_file, 4, file);
   single_step(why, imp->insert_file, imp->debugdb);
   end_txn();
 }
@@ -1214,6 +1233,20 @@ std::string Database::get_hash(const std::string &file, long modified) {
   bind_integer(why, imp->fetch_hash, 2, modified);
   if (sqlite3_step(imp->fetch_hash) == SQLITE_ROW) out = rip_column(imp->fetch_hash, 0);
   finish_stmt(why, imp->fetch_hash, imp->debugdb);
+  return out;
+}
+
+std::pair<std::string, std::string> Database::get_hash_type(const std::string &file,
+                                                            long modified) {
+  std::pair<std::string, std::string> out;
+  const char *why = "Could not fetch a cached hash and type";
+  bind_string(why, imp->fetch_hash_type, 1, file);
+  bind_integer(why, imp->fetch_hash_type, 2, modified);
+  if (sqlite3_step(imp->fetch_hash_type) == SQLITE_ROW) {
+    out.first = rip_column(imp->fetch_hash_type, 0);
+    out.second = rip_column(imp->fetch_hash_type, 1);
+  }
+  finish_stmt(why, imp->fetch_hash_type, imp->debugdb);
   return out;
 }
 
@@ -1485,8 +1518,12 @@ static JobReflection find_one(const Database *db, sqlite3_stmt *query) {
   // visible
   bind_integer(why, db->imp->get_tree, 1, desc.job);
   bind_integer(why, db->imp->get_tree, 2, VISIBLE);
-  while (sqlite3_step(db->imp->get_tree) == SQLITE_ROW)
-    desc.visible.emplace_back(rip_column(db->imp->get_tree, 0), rip_column(db->imp->get_tree, 1));
+  while (sqlite3_step(db->imp->get_tree) == SQLITE_ROW) {
+    std::string path = rip_column(db->imp->get_tree, 0);
+    std::string hash = rip_column(db->imp->get_tree, 1);
+    std::string type = normalize_file_reflection_type(rip_column(db->imp->get_tree, 2));
+    desc.visible.emplace_back(std::move(path), std::move(type), std::move(hash));
+  }
   finish_stmt(why, db->imp->get_tree, db->imp->debugdb);
   // tags
   bind_integer(why, db->imp->get_tags, 1, desc.job);
@@ -1498,15 +1535,23 @@ static JobReflection find_one(const Database *db, sqlite3_stmt *query) {
   // inputs
   bind_integer(why, db->imp->get_tree, 1, desc.job);
   bind_integer(why, db->imp->get_tree, 2, INPUT);
-  while (sqlite3_step(db->imp->get_tree) == SQLITE_ROW)
-    desc.inputs.emplace_back(rip_column(db->imp->get_tree, 0), rip_column(db->imp->get_tree, 1));
+  while (sqlite3_step(db->imp->get_tree) == SQLITE_ROW) {
+    std::string path = rip_column(db->imp->get_tree, 0);
+    std::string hash = rip_column(db->imp->get_tree, 1);
+    std::string type = normalize_file_reflection_type(rip_column(db->imp->get_tree, 2));
+    desc.inputs.emplace_back(std::move(path), std::move(type), std::move(hash));
+  }
   finish_stmt(why, db->imp->get_tree, db->imp->debugdb);
 
   // outputs
   bind_integer(why, db->imp->get_tree, 1, desc.job);
   bind_integer(why, db->imp->get_tree, 2, OUTPUT);
-  while (sqlite3_step(db->imp->get_tree) == SQLITE_ROW)
-    desc.outputs.emplace_back(rip_column(db->imp->get_tree, 0), rip_column(db->imp->get_tree, 1));
+  while (sqlite3_step(db->imp->get_tree) == SQLITE_ROW) {
+    std::string path = rip_column(db->imp->get_tree, 0);
+    std::string hash = rip_column(db->imp->get_tree, 1);
+    std::string type = normalize_file_reflection_type(rip_column(db->imp->get_tree, 2));
+    desc.outputs.emplace_back(std::move(path), std::move(type), std::move(hash));
+  }
   finish_stmt(why, db->imp->get_tree, db->imp->debugdb);
 
   return desc;

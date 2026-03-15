@@ -62,8 +62,27 @@ cas::Cas* CASContext::get_store(const std::string& workspace) {
 // CAS Primitives
 // ============================================================================
 
+namespace {
+
+bool parse_hash_string(const std::string& id, cas::ContentHash& out, std::string& error) {
+  if (id.empty() || cas::is_directory_hash_sentinel(id)) {
+    error = "Invalid CAS hash: " + id;
+    return false;
+  }
+
+  auto hash_result = cas::ContentHash::from_hex(id);
+  if (!hash_result) {
+    error = "Invalid CAS hash: " + id;
+    return false;
+  }
+  out = *hash_result;
+  return true;
+}
+
+}  // namespace
+
 // prim "cas_store_file" path: String -> Result String Error
-// Stores a file in CAS and returns its content hash
+// Stores a file in CAS and returns its content hash.
 static PRIMTYPE(type_cas_store_file) {
   TypeVar result;
   Data::typeResult.clone(result);
@@ -97,7 +116,7 @@ static PRIMFN(prim_cas_store_file) {
 }
 
 // prim "cas_has_blob" hash: String -> Boolean
-// Checks if a blob exists in the CAS store
+// Checks if a CAS blob exists in the store.
 static PRIMTYPE(type_cas_has_blob) {
   return args.size() == 1 && args[0]->unify(Data::typeString) &&
          out->unify(Data::typeBoolean);
@@ -114,19 +133,20 @@ static PRIMFN(prim_cas_has_blob) {
     RETURN(claim_bool(runtime.heap, false));
   }
 
-  auto hash_result = cas::ContentHash::from_hex(hash_str->c_str());
-  if (!hash_result) {
+  cas::ContentHash hash;
+  std::string parse_error;
+  if (!parse_hash_string(hash_str->c_str(), hash, parse_error)) {
     runtime.heap.reserve(reserve_bool());
     RETURN(claim_bool(runtime.heap, false));
   }
-  bool exists = store->has_blob(*hash_result);
+  bool exists = store->has_blob(hash);
 
   runtime.heap.reserve(reserve_bool());
   RETURN(claim_bool(runtime.heap, exists));
 }
 
 // prim "cas_materialize_file" hash: String -> destPath: String -> mode: Integer -> Result Unit Error
-// Materializes a file from CAS to the filesystem
+// Materializes a file blob from CAS to the filesystem.
 static PRIMTYPE(type_cas_materialize_file) {
   TypeVar result;
   Data::typeResult.clone(result);
@@ -151,16 +171,17 @@ static PRIMFN(prim_cas_materialize_file) {
     RETURN(claim_result(runtime.heap, false, err));
   }
 
-  auto hash_result = cas::ContentHash::from_hex(hash_str->c_str());
-  if (!hash_result) {
-    runtime.heap.reserve(reserve_result() + String::reserve(25));
-    auto err = String::claim(runtime.heap, "Invalid content hash hex");
+  cas::ContentHash hash;
+  std::string parse_error;
+  if (!parse_hash_string(hash_str->c_str(), hash, parse_error)) {
+    runtime.heap.reserve(reserve_result() + String::reserve(parse_error.size()));
+    auto err = String::claim(runtime.heap, parse_error);
     RETURN(claim_result(runtime.heap, false, err));
   }
   mode_t mode = static_cast<mode_t>(mpz_get_ui(mode_mpz));
 
   // Use 0 for mtime to let the system use current time
-  auto result = store->materialize_blob(*hash_result, dest_path->c_str(), mode, 0, 0);
+  auto result = store->materialize_blob(hash, dest_path->c_str(), mode, 0, 0);
   if (!result) {
     runtime.heap.reserve(reserve_result() + String::reserve(35));
     auto err = String::claim(runtime.heap, "Failed to materialize file from CAS");
@@ -172,9 +193,9 @@ static PRIMFN(prim_cas_materialize_file) {
 }
 
 // prim "cas_materialize_item" destPath type hashOrTarget mode mtimeSec mtimeNsec -> Result Unit Error
-// Materialize an item from CAS to workspace (files already in CAS) or create symlink/directory
-// - type="file": hashOrTarget = content hash, uses mode/mtime
-// - type="symlink": hashOrTarget = symlink target
+// Materialize an item from CAS to workspace (files already in CAS) or create symlink/directory.
+// - type="file": hashOrTarget = file hash, uses mode/mtime
+// - type="symlink": hashOrTarget = hash of the symlink target path blob
 // - type="directory": hashOrTarget = "" (unused), uses mode
 static PRIMTYPE(type_cas_materialize_item) {
   TypeVar result;
@@ -224,9 +245,10 @@ static PRIMFN(prim_cas_materialize_item) {
     }
 
     std::string hash_str_val = hash_or_target->c_str();
-    auto hash_result = cas::ContentHash::from_hex(hash_str_val.c_str());
-    if (!hash_result) {
-      std::string msg = "Invalid content hash: " + hash_str_val;
+    cas::ContentHash hash;
+    std::string parse_error;
+    if (!parse_hash_string(hash_str_val, hash, parse_error)) {
+      std::string msg = parse_error;
       runtime.heap.reserve(reserve_result() + String::reserve(msg.size()));
       auto err = String::claim(runtime.heap, msg);
       RETURN(claim_result(runtime.heap, false, err));
@@ -236,7 +258,7 @@ static PRIMFN(prim_cas_materialize_item) {
     long mtime_nsec = static_cast<long>(mpz_get_si(mtime_nsec_mpz));
 
     // Materialize from CAS to workspace with timestamps
-    auto mat_result = store->materialize_blob(*hash_result, dest_str.c_str(), mode, mtime_sec, mtime_nsec);
+    auto mat_result = store->materialize_blob(hash, dest_str.c_str(), mode, mtime_sec, mtime_nsec);
     if (!mat_result) {
       std::string msg = "Failed to materialize blob " + hash_str_val + " to " + dest_str;
       runtime.heap.reserve(reserve_result() + String::reserve(msg.size()));
@@ -245,16 +267,34 @@ static PRIMFN(prim_cas_materialize_item) {
     }
 
   } else if (type == "symlink") {
-    // Handle symlink: create symlink with target
-    std::string target = hash_or_target->c_str();
+    cas::Cas* store = ctx->get_store(".");
+    if (!store) {
+      runtime.heap.reserve(reserve_result() + String::reserve(28));
+      auto err = String::claim(runtime.heap, "CAS store not initialized");
+      RETURN(claim_result(runtime.heap, false, err));
+    }
 
-    // Remove existing file/symlink if present
-    (void)unlink(dest_str.c_str());
+    cas::ContentHash hash;
+    std::string parse_error;
+    if (!parse_hash_string(hash_or_target->c_str(), hash, parse_error)) {
+      runtime.heap.reserve(reserve_result() + String::reserve(parse_error.size()));
+      auto err = String::claim(runtime.heap, parse_error);
+      RETURN(claim_result(runtime.heap, false, err));
+    }
 
-    // Create the symlink
-    if (symlink(target.c_str(), dest_str.c_str()) != 0) {
+    auto target_result = store->read_blob(hash);
+    if (!target_result) {
       std::string msg =
-          "Failed to create symlink " + dest_str + " -> " + target + ": " + strerror(errno);
+          "Failed to materialize symlink " + std::string(hash_or_target->c_str()) + " to " +
+          dest_str;
+      runtime.heap.reserve(reserve_result() + String::reserve(msg.size()));
+      auto err = String::claim(runtime.heap, msg);
+      RETURN(claim_result(runtime.heap, false, err));
+    }
+
+    (void)unlink(dest_str.c_str());
+    if (symlink(target_result->c_str(), dest_str.c_str()) != 0) {
+      std::string msg = "Failed to create symlink " + dest_str + ": " + strerror(errno);
       runtime.heap.reserve(reserve_result() + String::reserve(msg.size()));
       auto err = String::claim(runtime.heap, msg);
       RETURN(claim_result(runtime.heap, false, err));
@@ -367,16 +407,17 @@ static PRIMFN(prim_cas_ingest_staging_file) {
     }
 
     // Verify the stored hash matches the expected hash
-    auto expected_hash_result = cas::ContentHash::from_hex(hash_str->c_str());
-    if (!expected_hash_result) {
-      std::string msg = "Invalid expected hash: " + std::string(hash_str->c_str());
+    cas::ContentHash expected_hash;
+    std::string parse_error;
+    if (!parse_hash_string(hash_str->c_str(), expected_hash, parse_error)) {
+      std::string msg = parse_error;
       runtime.heap.reserve(reserve_result() + String::reserve(msg.size()));
       auto err = String::claim(runtime.heap, msg);
       RETURN(claim_result(runtime.heap, false, err));
     }
     cas::ContentHash stored_hash = *store_result;
 
-    if (expected_hash_result->to_hex() != stored_hash.to_hex()) {
+    if (expected_hash != stored_hash) {
       std::string msg = "Hash mismatch: expected " + std::string(hash_str->c_str()) +
                         " but got " + stored_hash.to_hex();
       runtime.heap.reserve(reserve_result() + String::reserve(msg.size()));
@@ -389,7 +430,8 @@ static PRIMFN(prim_cas_ingest_staging_file) {
     time_t mtime_sec = static_cast<time_t>(mpz_get_si(mtime_sec_mpz));
     long mtime_nsec = static_cast<long>(mpz_get_si(mtime_nsec_mpz));
 
-    auto mat_result = store->materialize_blob(stored_hash, dest_str.c_str(), mode, mtime_sec, mtime_nsec);
+    auto mat_result = store->materialize_blob(stored_hash, dest_str.c_str(), mode, mtime_sec,
+                                              mtime_nsec);
     if (!mat_result) {
       std::string msg = "Failed to materialize blob " + stored_hash.to_hex() + " to " + dest_str;
       runtime.heap.reserve(reserve_result() + String::reserve(msg.size()));

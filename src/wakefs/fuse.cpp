@@ -62,16 +62,23 @@ bool json_as_struct(const std::string &json, json_args &result) {
 
   for (auto &x : jast.get("environment").children) result.environment.push_back(x.second.value);
 
-  // Parse visible files - supports both new format (objects with path/hash) and legacy (strings)
+  // Parse visible files - supports both new format (objects with path/type/hash) and legacy
+  // string entries.
   for (auto &x : jast.get("visible").children) {
     visible_file vf;
     if (x.second.kind == JSON_OBJECT) {
-      // New format: {"path": "...", "hash": "..."}
+      // New format: {"path": "...", "type": "...", "hash": "..."}
       vf.path = x.second.get("path").value;
+      vf.type = x.second.get("type").value;
       vf.hash = x.second.get("hash").value;
+      if (vf.type.empty()) {
+        std::cerr << "Visible entry object is missing required 'type' field\n";
+        return false;
+      }
     } else {
       // Legacy format: just a string path (no CAS lookup possible)
       vf.path = x.second.value;
+      vf.type = "";
       vf.hash = "";  // Empty hash means read from workspace
     }
     result.visible.push_back(vf);
@@ -153,7 +160,7 @@ static void add_file_metadata(const JAST &item_info, JAST &out_entry, long long 
   } catch (const std::exception &) {}
 }
 
-// Helper: Process a file or hardlink staging item
+// Helper: Process a staged file item
 // Returns true on success, false on failure (caller should skip this entry)
 static bool process_file_item(const JAST &item_info, const std::string &dest_path,
                               const std::string &type, JAST &out_entry, cas::Cas *cas_store,
@@ -194,7 +201,7 @@ static bool process_file_item(const JAST &item_info, const std::string &dest_pat
     }
   }
 
-  // Output as file type (hardlinks become regular files in output)
+  // Output as file type.
   out_entry.add("type", "file");
   out_entry.add("hash", hash_hex);
   add_file_metadata(item_info, out_entry, 0644LL);
@@ -202,9 +209,23 @@ static bool process_file_item(const JAST &item_info, const std::string &dest_pat
 }
 
 // Helper: Process a symlink staging item
-static void process_symlink_item(const JAST &item_info, JAST &out_entry) {
+static bool process_symlink_item(const JAST &item_info, const std::string &dest_path, JAST &out_entry,
+                                 cas::Cas *cas_store) {
+  std::string target = item_info.get("target").value;
+  if (target.empty()) {
+    std::cerr << "Missing target for symlink " << dest_path << std::endl;
+    return false;
+  }
+
+  auto store_result = cas_store->store_blob(target);
+  if (!store_result) {
+    std::cerr << "Failed to store symlink target in CAS for " << dest_path << std::endl;
+    return false;
+  }
+
   out_entry.add("type", "symlink");
-  out_entry.add("target", item_info.get("target").value);
+  out_entry.add("hash", store_result->to_hex());
+  return true;
 }
 
 // Helper: Process a directory staging item
@@ -213,8 +234,7 @@ static void process_directory_item(const JAST &item_info, JAST &out_entry) {
   add_file_metadata(item_info, out_entry, 0755LL);
 }
 
-// Process staging items from FUSE daemon: hash files, pass through symlinks/directories
-// Wake will handle CAS storage and materialization for all types
+// Process staging items from FUSE daemon: hash/store supported item types in CAS.
 static bool process_staging_files(const JAST &staging_files, JAST &staging_files_with_hash,
                                   cas::Cas *cas_store) {
   // Only log if DEBUG_FUSE_WAKE is set
@@ -222,9 +242,6 @@ static bool process_staging_files(const JAST &staging_files, JAST &staging_files
   STAGING_LOG("process_staging_files called with %zu entries\n", staging_files.children.size());
 
   // Single-pass processing using staging_path as deduplication key.
-  // Both files and hardlinks have staging_path; hardlinks share the same
-  // staging_path as their source file. First encounter hashes and deletes
-  // the staging file; subsequent encounters reuse the cached hash.
   std::map<std::string, std::string> staging_path_to_hash;
 
   for (const auto &entry : staging_files.children) {
@@ -232,22 +249,38 @@ static bool process_staging_files(const JAST &staging_files, JAST &staging_files
     const JAST &item_info = entry.second;
 
     std::string type = item_info.get("type").value;
-    if (type.empty()) type = "file";
+    if (type.empty()) {
+      std::cerr << "Staged item is missing required 'type' for " << dest_path << std::endl;
+      continue;
+    }
 
     STAGING_LOG("Processing: dest_path=%s type=%s\n", dest_path.c_str(), type.c_str());
 
-    JAST &out_entry = staging_files_with_hash.add(dest_path, JSON_OBJECT);
+    if (type == "hardlink") {
+      std::cerr << "CAS mode does not support hardlinks: " << dest_path << std::endl;
+      continue;
+    }
 
-    if (type == "file" || type == "hardlink") {
+    JAST out_entry(JSON_OBJECT);
+
+    if (type == "file") {
       if (!process_file_item(item_info, dest_path, type, out_entry, cas_store,
                              staging_path_to_hash, debug_log)) {
         continue;
       }
     } else if (type == "symlink") {
-      process_symlink_item(item_info, out_entry);
+      if (!process_symlink_item(item_info, dest_path, out_entry, cas_store)) {
+        continue;
+      }
     } else if (type == "directory") {
       process_directory_item(item_info, out_entry);
+    } else {
+      std::cerr << "CAS mode does not support staged item type '" << type << "' for " << dest_path
+                << std::endl;
+      continue;
     }
+
+    staging_files_with_hash.add(dest_path, std::move(out_entry));
   }
 
   STAGING_LOG("process_staging_files completed, processed %zu unique staging files\n",
@@ -413,7 +446,9 @@ bool run_in_fuse(fuse_args &args, int &status, std::string &result_json) {
     }
 
     if (timeout_pid == 0) {
+#ifdef __linux__
       prctl(PR_SET_NAME, "wb-timer", 0, 0, 0);
+#endif
       sleep(*args.command_timeout);
       exit(124);
     }

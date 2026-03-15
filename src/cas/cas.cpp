@@ -27,6 +27,7 @@
 #include <atomic>
 #include <filesystem>
 #include <fstream>
+#include <optional>
 #include <sstream>
 
 #include "wcl/file_ops.h"
@@ -305,5 +306,4 @@ wcl::result<bool, CASError> Cas::materialize_blob(const ContentHash& hash,
 
   return wcl::make_result<bool, CASError>(true);
 }
-
 }  // namespace cas

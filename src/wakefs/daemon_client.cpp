@@ -128,11 +128,12 @@ bool daemon_client::connect(std::vector<visible_file> &visible, const std::strin
   // Add CAS blobs directory
   for_daemon.add("cas_blobs_dir", cas_blobs_dir);
 
-  // Add visible files with path and hash
+  // Add visible files with path, type, and hash.
   auto &vis = for_daemon.add("visible", JSON_ARRAY);
   for (auto &v : visible) {
     auto &obj = vis.add(JSON_OBJECT);
     obj.add("path", v.path);
+    obj.add("type", v.type);
     obj.add("hash", v.hash);
   }
 

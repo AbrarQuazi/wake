@@ -79,12 +79,21 @@ export tuple RunnerInput =
     #     so that it can apply filtering after collecting the files written.
     export FnOutputs: (List String => List String)
 
+export data OutputSet =
+    OutputPaths (List String)
+    OutputResolved (List Path)
+
+export def outputSetPathNames = match _
+    OutputPaths paths -> paths
+    OutputResolved paths -> map getPathName paths
+
 # The result returned by a Runner after running a job
 export tuple RunnerOutput =
     # The filtered list of files actually read by the job. It can be used for more precise reruns
     export Inputs: List String
-    # The filtered list of files output by the job. These files are hashed and elevated to Path
-    export Outputs: List String
+    # The filtered list of files output by the job, either as raw output paths or already-resolved
+    # typed Paths.
+    export Outputs: OutputSet
     # The list of files output by the job that should be deleted by wake --clean. May include files
     # listed in Outputs as they will be removed later. The files in the list that are not in
     # Outputs will not be hashed, published, or elevated to Path but will be deleted by wake --clean
@@ -117,6 +126,26 @@ export tuple Runner =
 export def makeRunner (name: String) (run: Job => RunnerInput => RunnerOutput): Runner =
     Runner name run
 
+def stagingOutputPath (destPath: String) (itemInfo: JValue): Result Path Error =
+    require Some itemType =
+        itemInfo // `type`
+        | getJString
+    else failWithError "Missing type for staged output {destPath}"
+
+    require Pass pathType = pathTypeFromString itemType
+    else failWithError "Unknown staged output type '{itemType}' for {destPath}"
+
+    def hash =
+        if itemType ==* "directory" then
+            Some dirHash
+        else
+            itemInfo // `hash`
+            | getJString
+
+    match hash
+        Some outputHash -> Pass (mkPath destPath pathType outputHash)
+        None -> failWithError "Missing hash for staged output {destPath}"
+
 # localRunner: A runner that provides no sandboxing protections and no file tracking.
 #
 # You must use Fn{Inputs,Outputs} to fill in this information for wake to maintain safety and reusability
@@ -142,7 +171,7 @@ export def localRunner: Runner =
             Pass reality -> Pair reality None
 
         # Wait for the job to complete
-        def return _ = RunnerOutput fileInputs fileOutputs cleanable usage runnerError
+        def return _ = RunnerOutput fileInputs (OutputPaths fileOutputs) cleanable usage runnerError
 
         waitJobMerged return job
 
@@ -171,7 +200,7 @@ export def virtualRunner: Runner =
             Pass reality -> Pair reality None
 
         # Wait for the job to complete
-        def return _ = RunnerOutput fileInputs fileOutputs cleanable usage runnerError
+        def return _ = RunnerOutput fileInputs (OutputPaths fileOutputs) cleanable usage runnerError
 
         waitJobMerged return job
 
@@ -234,14 +263,15 @@ export def makeJSONRunner ((JSONRunnerPlan rawScript extraArgs extraEnv estimate
             def runnerError = "Runner {script} is not executable".makeError
             def _ = markJobSetupFailure job runnerError
 
-            RunnerOutput Nil Nil Nil emptyUsage (Some runnerError)
+            RunnerOutput Nil (OutputPaths Nil) Nil emptyUsage (Some runnerError)
 
         def Usage jobStatus runtime cputime membytes inbytes outbytes = record
 
-        # Helper to serialize a Path as {path, hash} for CAS-based reads
+        # Helper to serialize a Path as {path, type, hash} for visible reads
         def mkVisibleJson (p: Path): JValue =
             JObject (
                 "path" :-> JString p.getPathName,
+                "type" :-> JString (pathTypeToString p.getPathType),
                 "hash" :-> JString p.getPathHash,
                 Nil
             )
@@ -282,7 +312,7 @@ export def makeJSONRunner ((JSONRunnerPlan rawScript extraArgs extraEnv estimate
             | rmapFail (markJobSetupFailure job)
 
         require Pass _ = writeResult
-        else RunnerOutput Nil Nil Nil emptyUsage writeResult.getFail
+        else RunnerOutput Nil (OutputPaths Nil) Nil emptyUsage writeResult.getFail
 
         def cmd = script, "-I", "-p", specFile, "-o", resultFile, extraArgs
 
@@ -317,12 +347,12 @@ export def makeJSONRunner ((JSONRunnerPlan rawScript extraArgs extraEnv estimate
         require 0 = runnerStatusCode
         else
             Some "Non-zero exit status ({str runnerStatusCode}) for JSON runner on {specFile}".makeError
-            | RunnerOutput Nil Nil (specFile, Nil) runnerUsage
+            | RunnerOutput Nil (OutputPaths Nil) (specFile, Nil) runnerUsage
 
-        require Pass content = parseJSONFile (Path resultFile "BadHash")
+        require Pass content = parseJSONFile (mkPath resultFile PathTypeRegularFile "BadHash")
         else
             Some "Failed to parse output {resultFile} for JSON runner".makeError
-            | RunnerOutput Nil Nil (specFile, Nil) runnerUsage
+            | RunnerOutput Nil (OutputPaths Nil) (specFile, Nil) runnerUsage
 
         def field name = match _ _
             _ (Fail f) -> Fail f
@@ -340,22 +370,29 @@ export def makeJSONRunner ((JSONRunnerPlan rawScript extraArgs extraEnv estimate
             | field "inbytes" (jsonUsage // `inbytes` | getJInteger)
             | field "outbytes" (jsonUsage // `outbytes` | getJInteger)
 
-        # Process staging items: materialize each item from CAS to workspace
-        # Files are already stored in CAS by wakebox, so we just materialize from hash
-        # Symlinks and directories are created directly
+        # Process staging items: materialize each item from CAS to workspace.
+        # Files and symlinks are already stored in CAS by wakebox.
 
         # Helper for processing file type staging items (files already in CAS)
         def processStagingFile destPath itemInfo =
-            require Some hash = itemInfo // `hash` | getJString
+            require Some hash =
+                itemInfo // `hash`
+                | getJString
             else failWithError "Missing hash for file {destPath}"
 
-            require Some mode = itemInfo // `mode` | getJInteger
+            require Some mode =
+                itemInfo // `mode`
+                | getJInteger
             else failWithError "Missing mode for file {destPath}"
 
-            require Some mtimeSec = itemInfo // `mtime_sec` | getJInteger
+            require Some mtimeSec =
+                itemInfo // `mtime_sec`
+                | getJInteger
             else failWithError "Missing mtime_sec for file {destPath}"
 
-            require Some mtimeNsec = itemInfo // `mtime_nsec` | getJInteger
+            require Some mtimeNsec =
+                itemInfo // `mtime_nsec`
+                | getJInteger
             else failWithError "Missing mtime_nsec for file {destPath}"
 
             casMaterializeItem destPath "file" hash mode mtimeSec mtimeNsec
@@ -363,53 +400,64 @@ export def makeJSONRunner ((JSONRunnerPlan rawScript extraArgs extraEnv estimate
 
         # Helper for processing symlink type staging items
         def processStagingSymlink destPath itemInfo =
-            require Some linkTarget = itemInfo // `target` | getJString
-            else failWithError "Missing target for symlink {destPath}"
+            require Some hash =
+                itemInfo // `hash`
+                | getJString
+            else failWithError "Missing hash for symlink {destPath}"
 
-            casMaterializeItem destPath "symlink" linkTarget 0 0 0
-            | addErrorContext "Creating symlink {destPath} -> {linkTarget}"
+            casMaterializeItem destPath "symlink" hash 0 0 0
+            | addErrorContext "Materializing symlink from CAS {hash} -> {destPath}"
 
         # Helper for processing directory type staging items
         def processStagingDirectory destPath itemInfo =
-            def mode = itemInfo // `mode` | getJInteger | getOrElse 493  # 0755 octal
+            def mode =
+                itemInfo // `mode`
+                | getJInteger
+                | getOrElse 493 # 0755 octal
+
             casMaterializeItem destPath "directory" "" mode 0 0
             | addErrorContext "Creating directory {destPath}"
 
         def processStagingItem (destPath: String) (itemInfo: JValue): Result Unit Error =
-            require Some itemType = itemInfo // `type` | getJString
+            require Some itemType =
+                itemInfo // `type`
+                | getJString
             else failWithError "Missing type for {destPath}"
 
-            if itemType ==* "file" then processStagingFile destPath itemInfo
-            else if itemType ==* "symlink" then processStagingSymlink destPath itemInfo
-            else if itemType ==* "directory" then processStagingDirectory destPath itemInfo
-            else failWithError "Unknown staging item type '{itemType}' for {destPath}"
+            if itemType ==* "file" then
+                processStagingFile destPath itemInfo
+            else if itemType ==* "symlink" then
+                processStagingSymlink destPath itemInfo
+            else if itemType ==* "directory" then
+                processStagingDirectory destPath itemInfo
+            else
+                failWithError "Unknown staging item type '{itemType}' for {destPath}"
 
-        def stagingFilesResult =
-            match (content // `staging_files` | getJObject)
-                None -> Pass Unit
-                Some entries ->
-                    def ingestEntry (Pair destPath itemInfo) = processStagingItem destPath itemInfo
-                    entries
-                    | map ingestEntry
-                    | findFail
-                    | rmap (\_ Unit)
+        def stagingFilesResult = match (content // `staging_files` | getJObject)
+            None -> Pass Unit
+            Some entries ->
+                def ingestEntry (Pair destPath itemInfo) = processStagingItem destPath itemInfo
+
+                entries
+                | map ingestEntry
+                | findFail
+                | rmap (\_ Unit)
 
         require Pass _ = stagingFilesResult
         else
             stagingFilesResult.getFail
-            | RunnerOutput Nil Nil (specFile, Nil) runnerUsage
+            | RunnerOutput Nil (OutputPaths Nil) (specFile, Nil) runnerUsage
 
         # Extract string from either a plain string or an object with "path" field
         # This handles both old format (strings) and new format (objects with path/hash)
-        def extractPath (jval: JValue): Option String =
-            match jval
-                JString s -> Some s
-                JObject fields ->
-                    # find returns Option (Pair (Pair String JValue) Integer)
-                    match (find (\(Pair k _) k ==* "path") fields)
-                        Some (Pair (Pair _ pathVal) _) -> getJString pathVal
-                        None -> None
-                _ -> None
+        def extractPath (jval: JValue): Option String = match jval
+            JString s -> Some s
+            JObject fields ->
+                # find returns Option (Pair (Pair String JValue) Integer)
+                match (find (\(Pair k _) k ==* "path") fields)
+                    Some (Pair (Pair _ pathVal) _) -> getJString pathVal
+                    None -> None
+            _ -> None
 
         def getK exp =
             content // exp
@@ -427,15 +475,35 @@ export def makeJSONRunner ((JSONRunnerPlan rawScript extraArgs extraEnv estimate
         def jsonInputs = getK `inputs`
         def jsonOutputs = getOutputPaths
         def filteredInputs = fnInputs jsonInputs
-        def filteredOutputs = fnOutputs jsonOutputs
+        def filteredOutputPaths = fnOutputs jsonOutputs
         def cleanableOutputs = specFile, resultFile, jsonOutputs
 
-        match jobUsageResult
-            Pass jobUsage ->
+        def outputSetResult = match (useCasHashes; content // `staging_files` | getJObject)
+            True; Some entries ->
+                def resolveOutput destPath = match (find (\(Pair k _) k ==* destPath) entries)
+                    Some (Pair (Pair _ itemInfo) _) -> stagingOutputPath destPath itemInfo
+                    None -> failWithError "Missing staging metadata for CAS output {destPath}"
+
+                filteredOutputPaths
+                | map resolveOutput
+                | findFail
+                | rmap OutputResolved
+            True; None ->
+                require False = empty filteredOutputPaths
+                else failWithError "Missing staging_files metadata for CAS outputs"
+
+                Pass (OutputResolved Nil)
+            False; _ -> Pass (OutputPaths filteredOutputPaths)
+
+        match (jobUsageResult; outputSetResult)
+            Pass jobUsage; Pass outputSet ->
                 None
-                | RunnerOutput filteredInputs filteredOutputs cleanableOutputs jobUsage
-            Fail msg ->
+                | RunnerOutput filteredInputs outputSet cleanableOutputs jobUsage
+            Pass _; Fail err ->
+                Some err
+                | RunnerOutput filteredInputs (OutputPaths Nil) cleanableOutputs runnerUsage
+            Fail msg; _ ->
                 Some msg.makeError
-                | RunnerOutput filteredInputs filteredOutputs cleanableOutputs runnerUsage
+                | RunnerOutput filteredInputs (OutputPaths Nil) cleanableOutputs runnerUsage
 
     makeRunner "json-{script}" run

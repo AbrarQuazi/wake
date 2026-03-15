@@ -51,11 +51,11 @@ class Cas {
   // Get the root directory of this store
   const std::string& root() const { return root_; }
 
-  // Store a blob from a file, returns the content hash
-  // Uses reflink if possible, otherwise copies the file
+  // Store a blob from a file, returning its content hash.
+  // Uses reflink if possible, otherwise copies the file.
   wcl::result<ContentHash, CASError> store_blob_from_file(const std::string& path);
 
-  // Store a blob from memory, returns the content hash
+  // Store a blob from memory, returning its content hash.
   wcl::result<ContentHash, CASError> store_blob(const std::string& data);
 
   // Check if a blob exists
