@@ -137,41 +137,23 @@ def doInstall dest kind =
 
     require Pass variant = toVariant kind
 
-    def releaseBinAliasDest exe =
+    def releaseBinDest exe =
         "{dest}/{replace `\.[^.]*$` '' exe.getPathName}"
 
-    def releaseBinVariantDest exe =
-        "{dest}/{exe.getPathName}"
-
-    # Install variant outputs twice: once under the stable tool name and once under the
-    # full variant-specific filename, eg:
-    #   wake-cas/bin/wake
-    #   wake-cas/bin/wake.native-cpp17-release
-    def releaseBin exe =
-        def aliasDest = releaseBinAliasDest exe
-        def variantDest = releaseBinVariantDest exe
-
-        require Pass aliasInstalled = installAs aliasDest exe
-        if aliasDest ==* variantDest then
-            Pass (aliasInstalled, Nil)
-        else
-            require Pass variantInstalled = installAs variantDest exe
-
-            Pass (aliasInstalled, variantInstalled, Nil)
+    def releaseBin exe = installAs (releaseBinDest exe) exe
 
     def install_binfiles =
         all variant
         | rmapPass (\allFiles
-            # When a binary exists in both plain and variant forms (e.g. wake-stage and
-            # wake-stage.native-cpp17-release), only process the variant form.
-            # releaseBin installs it to both the stable alias and the variant-specific path,
-            # so keeping the plain form would create a second job writing the same alias dest.
-            def hasVariantSuffix f = (releaseBinAliasDest f) !=* (releaseBinVariantDest f)
-            def variantFiles = filter hasVariantSuffix allFiles
-            def variantAliases = map releaseBinAliasDest variantFiles
-            def dedupedFiles =
-                filter (\f hasVariantSuffix f || !exists (_ ==* releaseBinAliasDest f) variantAliases) allFiles
-            map releaseBin dedupedFiles | findFail | rmap flatten
+            # When a binary exists in both plain and variant-suffixed forms (e.g. wake-stage
+            # and wake-stage.native-cpp17-release), both strip to the same install destination.
+            # Prefer the variant-suffixed file and drop any plain file whose dest is already
+            # covered, to avoid two installAs jobs writing the same output path.
+            def isVariantSuffixed f = (replace `\.[^.]*$` '' f.getPathName) !=* f.getPathName
+            def variantDests = filter isVariantSuffixed allFiles | map releaseBinDest
+            def files =
+                filter (\f isVariantSuffixed f || !exists (_ ==* releaseBinDest f) variantDests) allFiles
+            map releaseBin files | findFail
         )
 
     # Join on the installs now that everything has been kicked off
