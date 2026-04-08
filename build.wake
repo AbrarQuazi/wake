@@ -137,11 +137,42 @@ def doInstall dest kind =
 
     require Pass variant = toVariant kind
 
-    def releaseBin exe = installAs "{dest}/{replace `\.[^.]*$` '' exe.getPathName}" exe
+    def releaseBinAliasDest exe =
+        "{dest}/{replace `\.[^.]*$` '' exe.getPathName}"
+
+    def releaseBinVariantDest exe =
+        "{dest}/{exe.getPathName}"
+
+    # Install variant outputs twice: once under the stable tool name and once under the
+    # full variant-specific filename, eg:
+    #   wake-cas/bin/wake
+    #   wake-cas/bin/wake.native-cpp17-release
+    def releaseBin exe =
+        def aliasDest = releaseBinAliasDest exe
+        def variantDest = releaseBinVariantDest exe
+
+        require Pass aliasInstalled = installAs aliasDest exe
+        if aliasDest ==* variantDest then
+            Pass (aliasInstalled, Nil)
+        else
+            require Pass variantInstalled = installAs variantDest exe
+
+            Pass (aliasInstalled, variantInstalled, Nil)
 
     def install_binfiles =
         all variant
-        | rmapPass (\files map releaseBin files | findFail)
+        | rmapPass (\allFiles
+            # When a binary exists in both plain and variant forms (e.g. wake-stage and
+            # wake-stage.native-cpp17-release), only process the variant form.
+            # releaseBin installs it to both the stable alias and the variant-specific path,
+            # so keeping the plain form would create a second job writing the same alias dest.
+            def hasVariantSuffix f = (releaseBinAliasDest f) !=* (releaseBinVariantDest f)
+            def variantFiles = filter hasVariantSuffix allFiles
+            def variantAliases = map releaseBinAliasDest variantFiles
+            def dedupedFiles =
+                filter (\f hasVariantSuffix f || !exists (_ ==* releaseBinAliasDest f) variantAliases) allFiles
+            map releaseBin dedupedFiles | findFail | rmap flatten
+        )
 
     # Join on the installs now that everything has been kicked off
     require Pass readme = install_readme
