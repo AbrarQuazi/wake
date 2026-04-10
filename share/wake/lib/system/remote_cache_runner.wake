@@ -61,9 +61,13 @@ export def mkRemoteCacheRunner (rscApi: RemoteCacheApi) (hashFn: RunnerInput => 
         # workspace locations. This is left as 'def _' so that wake won't block progess
         # on it but it will stil be joined on before wake exits.
         def postFinalize _ =
-            def _ = postJob rscApi job wakeroot hashKey input output
+            def result = postJob rscApi job wakeroot hashKey input output
 
-            Unit
+            match result
+                Pass _ -> Unit
+                Fail err ->
+                    def _ = printlnLevel logWarning "RSC postJob failed: {err.getErrorCause}"
+                    Unit
 
         output
         | editRunnerOutputOutputs (setStagedOutputsPostFinalize postFinalize)
