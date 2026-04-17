@@ -351,13 +351,19 @@ void Job::parse() {
       files_visible.insert(path);
       visible_entries[path] = VisibleEntry{type, hash, mode};
 
-      // Add implicit parent directories for this path
-      for (size_t slash = path.find('/'); slash != std::string::npos;
-           slash = path.find('/', slash + 1)) {
-        std::string parent = path.substr(0, slash);
-        if (visible_entries.find(parent) == visible_entries.end()) {
-          files_visible.insert(parent);
-          visible_entries[parent] = VisibleEntry{"directory", "", std::nullopt};
+      // Add implicit parent directories for this path.
+      // Only needed in CAS mode where the filesystem is virtualized and parent
+      // directories may not exist on disk.  In legacy mode the real filesystem
+      // already contains these directories, and adding them to files_visible
+      // causes wakefuse_mkdir to return EEXIST before the directory is created.
+      if (g_use_cas) {
+        for (size_t slash = path.find('/'); slash != std::string::npos;
+             slash = path.find('/', slash + 1)) {
+          std::string parent = path.substr(0, slash);
+          if (visible_entries.find(parent) == visible_entries.end()) {
+            files_visible.insert(parent);
+            visible_entries[parent] = VisibleEntry{"directory", "", std::nullopt};
+          }
         }
       }
     }
@@ -371,16 +377,13 @@ static std::string cas_blob_path(const cas::ContentHash &hash) {
 }
 
 // Parse and validate a CAS content hash from a visible entry.
-// Returns false for directories (which don't have content hashes) or invalid hashes.
-// On success, populates content_hash with the parsed hash.
-static bool parse_visible_hash(const std::string &type, const std::string &hash,
-                               cas::ContentHash *content_hash) {
-  if (hash.empty() || type == "directory") return false;
-
-  auto result = cas::ContentHash::from_hex(hash);
-  if (!result) return false;
-  *content_hash = *result;
-  return true;
+// Returns std::nullopt for directories (which don't have content hashes) or invalid hashes.
+static std::optional<cas::ContentHash> parse_visible_hash(const std::string &type,
+                                                          const std::string &hash) {
+  if (hash.empty() || type == "directory") return std::nullopt;
+  auto parsed = cas::ContentHash::from_hex(hash);
+  if (!parsed) return std::nullopt;
+  return *parsed;
 }
 
 // Extract file permission bits (rwxrwxrwx) from a VisibleEntry.
@@ -1894,15 +1897,15 @@ static int wakefuse_open(const char *path, struct fuse_file_info *fi) {
       if (type != "symlink" && type != "directory" &&
           parse_visible_hash(type, visible_it->second.hash, &hash)) {
         std::string blob_path = cas_blob_path(hash);
-        int fd = open(blob_path.c_str(), O_RDONLY);
-        if (fd != -1) {
-          fi->fh = fd;
-          return 0;
+          int fd = open(blob_path.c_str(), O_RDONLY);
+          if (fd != -1) {
+            fi->fh = fd;
+            return 0;
+          }
+          // Fall through to workspace if CAS blob not found
         }
-        // Fall through to workspace if CAS blob not found
       }
     }
-  }
 
   // Fallback: read from workspace
   // TODO: Remove workspace fallback once Source adds files to CAS directly
