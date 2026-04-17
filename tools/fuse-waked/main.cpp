@@ -1224,9 +1224,18 @@ static int wakefuse_mkdir(const char *path, mode_t mode) {
     it->second.staged_paths.insert(key.second);
   } else {
     // TODO: Remove the direct-to-workspace mkdir path once WAKE_CAS is the default.
-    // Legacy mode: create directory in workspace
-    if (!it->second.is_writeable(key.second)) (void)deep_unlink(context.rootfd, key.second.c_str());
-    int res = mkdirat(context.rootfd, key.second.c_str(), mode);
+    // Legacy mode: create directory in workspace.
+    // Use unlinkat (not deep_unlink) to clear non-directory entities without
+    // destroying directories that concurrent jobs may be using.
+    int res = unlinkat(context.rootfd, key.second.c_str(), 0);
+    if (res == -1 && errno != EPERM && errno != ENOENT && errno != EISDIR) return -errno;
+
+    res = mkdirat(context.rootfd, key.second.c_str(), mode);
+
+    // If a directory already exists (created by another job), claim it.
+    if (res == -1 && (errno == EEXIST || errno == EISDIR))
+      res = fchmodat(context.rootfd, key.second.c_str(), mode, 0);
+
     if (res == -1) return -errno;
   }
 
