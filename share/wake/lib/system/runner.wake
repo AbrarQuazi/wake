@@ -288,8 +288,8 @@ export def stageWorkspaceOutputs (allOutputPaths: List String) (filteredOutputPa
             stagingItems
             | map getStagingItemDestPath
 
-        require True = subset scmp normAllOutputPaths stagedOutputPaths
-        else failWithError "Missing staged metadata for workspace outputs"
+        require True = subset scmp stagedOutputPaths normAllOutputPaths
+        else failWithError "Staged output not in expected workspace outputs"
 
         def stagingRootOutputs = match stagingRoot
             Some root -> root, Nil
