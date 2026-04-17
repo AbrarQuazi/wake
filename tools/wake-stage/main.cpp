@@ -187,9 +187,6 @@ std::vector<StageEntry> stage_outputs(const std::vector<std::string>& output_pat
 
     struct stat st;
     if (lstat(dest_path.c_str(), &st) != 0) {
-      if (errno == ENOENT) {
-        continue;
-      }
       throw std::runtime_error("lstat(" + dest_path + "): " + strerror(errno));
     }
 
