@@ -295,7 +295,15 @@ export def stageWorkspaceOutputs (allOutputPaths: List String) (filteredOutputPa
             Some root -> root, Nil
             None -> Nil
 
-        def cleanableOutputs = baseCleanableOutputs ++ stagingRootOutputs
+        # Include every staged dest path in the cleanable set so unpublished outputs
+        # (those dropped by fnOutputs) land in unhashed_files via finish_job's
+        # unhashed_outputs = all_outputs - outputs computation at
+        # src/runtime/database.cpp:1056-1065. Published paths are harmlessly filtered
+        # out of unhashed_outputs by the output_set.count(path) check at line 1064.
+        # This mirrors the CAS branch that returns (specFile, resultFile, stagedOutputPaths).
+        def cleanableOutputs =
+            (baseCleanableOutputs ++ stagedOutputPaths ++ stagingRootOutputs)
+            | distinctBy scmp
 
         Pass (
             Pair
